@@ -247,7 +247,8 @@ import { TranscribeCredentials } from 'aws-transcribe-client';
 // Create a credentials provider that fetches from your server
 const credentialsProvider = async (minutesUsed: number): Promise<TranscribeCredentials> => {
   try {
-    // Optional: send previously used minutes back to the server
+    // Optional: send previously used minutes back to the server. 
+    // This can be used for more accurate usage tracking or throttling logic.
     const params = minutesUsed > 0 ? { "last-request-mins-used": minutesUsed } : {};
     
     const response = await fetch('/api/aws-transcribe/get-credentials', {
@@ -326,6 +327,91 @@ The client is designed to work across all modern browsers, including Safari, whi
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+### Development Setup
+
+1. Clone the repository
+2. Install dependencies:
+   ```bash
+   npm install
+   ```
+3. Build the project:
+   ```bash
+   npm run build
+   ```
+4. Run tests:
+   ```bash
+   npm test
+   ```
+
+### Important Notes on Module Configuration
+
+This project uses ES Modules for its build system:
+
+- The package.json includes `"type": "module"` to specify ES module format
+- Rollup configuration uses ES module syntax and dynamic imports
+- When importing JSON files in ESM context, use the fs module:
+  ```javascript
+  import { readFileSync } from 'fs';
+  const packageJson = JSON.parse(
+    readFileSync(new URL('./package.json', import.meta.url), 'utf8')
+  );
+  ```
+
+### Local Development with npm link
+
+To test changes locally in another project:
+
+1. Build your changes:
+   ```bash
+   npm run build
+   ```
+2. Create a global link:
+   ```bash
+   npm link
+   ```
+3. In your application project:
+   ```bash
+   npm link aws-transcribe-client
+   ```
+4. When done, unlink:
+   ```bash
+   # In your application
+   npm unlink aws-transcribe-client
+   
+   # In aws-transcribe-client
+   npm unlink
+   ```
+
+### Troubleshooting npm link in Bundlers
+
+If you're using a bundler like Webpack, Vite, or Rollup with npm link, you might encounter issues with:
+
+- Multiple React instances
+- Module resolution errors
+- Hot reloading not working
+
+To fix these issues:
+
+1. Use the `resolve.alias` option in your bundler to point to the linked package
+2. For React dependencies, use `resolve.alias` to ensure a single React instance:
+   ```javascript
+   // Webpack example
+   resolve: {
+     alias: {
+       react: path.resolve('./node_modules/react')
+     }
+   }
+   ```
+3. For Vite specifically:
+   ```javascript
+   // vite.config.js
+   export default defineConfig({
+     resolve: {
+       preserveSymlinks: true
+     }
+   });
+   ```
 
 ## License
 

@@ -15,6 +15,15 @@ export interface TranscribeCredentials {
     reservedMinutes?: number;
 }
 
+export type TranscribeCredentialsProvider = (minutesUsed: number) => Promise<TranscribeCredentials> | null;
+
+export type Logger = (message: string, ...args: unknown[]) => void;
+
+export type BrowserSupported = {
+    browserSupported: boolean;
+    AudioContextClass?: typeof AudioContext;
+}
+
 export interface TranscriptData {
     transcript: string;
     interimTranscript: string;
@@ -36,13 +45,38 @@ export interface TranscribeOptions {
     silenceDuration?: number;
     maxSilenceDuration?: number;
     bufferSize?: number;
-    credentialsProvider: (minutesUsed: number) => Promise<TranscribeCredentials>;
+    debug?: boolean;
+    credentialsProvider: TranscribeCredentialsProvider;
     generateSessionId?: () => string;
     onTranscript?: (data: TranscriptData) => void;
     onSpeechStart?: () => void;
     onSpeechEnd?: () => void;
     onError?: (error: string) => void;
     onStateChange?: (state: TranscribeState) => void;
+}
+
+// Type definitions for Web Audio API and transcription results
+interface AudioProcessingEvent {
+    inputBuffer: {
+        getChannelData(channel: number): Float32Array;
+    };
+}
+
+interface TranscriptionResult {
+    TranscriptEvent?: {
+        Transcript?: {
+            Results?: Array<{
+                IsPartial?: boolean;
+                Alternatives?: Array<{
+                    Transcript?: string;
+                }>;
+            }>;
+        };
+    };
+}
+
+interface WebkitWindow extends Window {
+    webkitAudioContext: typeof AudioContext;
 }
 
 // Constants for voice activity detection and silence handling
@@ -57,8 +91,8 @@ const MINUTES_USED_KEY = 'aws_transcribe_minutes_used';
 
 // Custom ReadableStream that works in Safari
 class ReadableStream {
-    private listeners: Array<{ resolve: (value: any) => void }>;
-    private buffer: Array<any>;
+    private listeners: Array<{ resolve: (value: { value: unknown; done: boolean }) => void }>;
+    private buffer: Array<unknown>;
     private closed: boolean;
 
     constructor() {
@@ -67,7 +101,7 @@ class ReadableStream {
         this.closed = false;
     }
 
-    enqueue(chunk: any): void {
+    enqueue(chunk: unknown): void {
         if (this.closed) return;
 
         if (this.listeners.length > 0) {
@@ -92,6 +126,7 @@ class ReadableStream {
 
     [Symbol.asyncIterator]() {
         return {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             next: (): Promise<{ value: any; done: boolean }> => {
                 if (this.closed && this.buffer.length === 0) {
                     return Promise.resolve({ value: undefined, done: true });
@@ -111,35 +146,64 @@ class ReadableStream {
     }
 }
 
-// Helper functions for credential management
-const loadStoredCredentials = (): TranscribeCredentials | null => {
-    if (typeof localStorage === 'undefined') return null;
+class AWSCredentials {
+    private readonly log: Logger;
+    private readonly credentialsProvider: TranscribeCredentialsProvider;
 
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (!stored) return null;
-
-    try {
-        const parsed = JSON.parse(stored);
-        return {
-            ...parsed,
-            expiration: new Date(parsed.expiration)
-        };
-    } catch (e) {
-        console.error('Failed to parse stored credentials:', e);
-        localStorage.removeItem(STORAGE_KEY);
-        return null;
+    constructor(credentialsProvider: TranscribeCredentialsProvider, log: Logger) {
+        this.log = log;
+        this.credentialsProvider = credentialsProvider;
     }
-};
 
-const storeCredentials = (creds: TranscribeCredentials | null): void => {
-    if (typeof localStorage === 'undefined') return;
+    async getCredentials(): Promise<TranscribeCredentials> {
+        if (!this.credentialsProvider) {
+            throw new Error('No credentials provider available');
+        }
 
-    if (!creds) {
-        localStorage.removeItem(STORAGE_KEY);
-        return;
+        const existingCreds = this.loadStoredCredentials();
+        if (existingCreds && existingCreds.expiration.getTime() > Date.now()) {
+            this.log('Using existing credentials');
+            return existingCreds;
+        }
+
+        const credentials = await this.credentialsProvider(getMinutesUsed());
+        if (!credentials) {
+            throw new Error('No credentials available');
+        }
+
+        this.storeCredentials(credentials);
+        return credentials;
     }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(creds));
-};
+
+
+    private loadStoredCredentials = (): TranscribeCredentials | null => {
+        if (typeof localStorage === 'undefined') { return null; }
+
+        const stored = localStorage.getItem(STORAGE_KEY);
+        if (!stored) return null;
+
+        try {
+            const parsed = JSON.parse(stored);
+            return {
+                ...parsed,
+                expiration: new Date(parsed.expiration)
+            };
+        } catch (e) {
+            this.log('Failed to parse stored credentials:', e);
+            localStorage.removeItem(STORAGE_KEY);
+            throw e;
+        }
+    };
+
+    private storeCredentials = (creds: TranscribeCredentials | null): void => {
+        if (typeof localStorage === 'undefined') { return; }
+        if (!creds) {
+            localStorage.removeItem(STORAGE_KEY);
+            return;
+        }
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(creds));
+    };
+}
 
 const getMinutesUsed = (): number => {
     if (typeof localStorage === 'undefined') return 0;
@@ -180,7 +244,12 @@ export class AWSTranscribeClient {
     private silenceTimeout: number | null;
     private activeStreaming: boolean;
     private customStream: ReadableStream | null;
-    private transcribeStream: any;
+    private transcribeStream: unknown;
+    private awsCredentials: AWSCredentials;
+    private readonly AudioContextClass: {
+        prototype: AudioContext;
+        new(contextOptions?: AudioContextOptions): AudioContext
+    } | undefined;
 
     constructor(options: TranscribeOptions) {
         // Configuration options with defaults
@@ -192,6 +261,7 @@ export class AWSTranscribeClient {
             silenceDuration: options.silenceDuration || SILENCE_DURATION,
             maxSilenceDuration: options.maxSilenceDuration || MAX_SILENCE_DURATION,
             bufferSize: options.bufferSize || BUFFER_SIZE,
+            debug: options.debug || false,
             credentialsProvider: options.credentialsProvider,
             onTranscript: options.onTranscript || (() => {}),
             onSpeechStart: options.onSpeechStart || (() => {}),
@@ -201,11 +271,12 @@ export class AWSTranscribeClient {
             generateSessionId: options.generateSessionId || generateUUID
         };
 
+        this.awsCredentials = new AWSCredentials(this.config.credentialsProvider, this._log.bind(this));
+
         // Internal state
         this.isListening = false;
         this.isActivelySpeaking = false;
         this.silenceCountdown = null;
-        this.browserSupported = true;
 
         // Refs to maintain state between functions
         this.audioContext = null;
@@ -222,25 +293,39 @@ export class AWSTranscribeClient {
         this.customStream = null;
         this.transcribeStream = null;
 
+
         // Check for browser compatibility
-        this._checkBrowserCompatibility();
+        const compatibility = this._checkBrowserCompatibility();
+        this.browserSupported = compatibility.browserSupported;
+        this.AudioContextClass = compatibility.AudioContextClass;
     }
 
-    private _checkBrowserCompatibility(): void {
+    /**
+     * Logs debug messages if debug mode is enabled
+     */
+    private _log(message: string, ...args: unknown[]): void {
+        if (this.config.debug) {
+            // eslint-disable-next-line no-console
+            console.log(`[AWSTranscribe] ${message}`, ...args);
+        }
+    }
+
+    private _checkBrowserCompatibility(): BrowserSupported {
         if (typeof window === 'undefined') {
             this.browserSupported = false;
-            return;
+            return {browserSupported: false};
         }
 
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
             this.browserSupported = false;
-            return;
+            return {browserSupported: false};
         }
 
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        const AudioContextClass = window.AudioContext || (window as unknown as WebkitWindow).webkitAudioContext;
         if (!AudioContextClass) {
-            this.browserSupported = false;
+            return {browserSupported: false};
         }
+        return {browserSupported: true, AudioContextClass};
     }
 
     public isBrowserSupported(): boolean {
@@ -251,28 +336,8 @@ export class AWSTranscribeClient {
         this.config.onTranscript({ transcript, interimTranscript, resetTranscript });
     }
 
-    private async _getCredentials(): Promise<TranscribeCredentials> {
-        if (!this.config.credentialsProvider) {
-            throw new Error('No credentials provider available');
-        }
-
-        const existingCreds = loadStoredCredentials();
-        if (existingCreds && existingCreds.expiration.getTime() > Date.now()) {
-            console.log('Using existing credentials');
-            return existingCreds;
-        }
-
-        const credentials = await this.config.credentialsProvider(getMinutesUsed());
-        if (credentials) {
-            storeCredentials(credentials);
-            return credentials;
-        }
-
-        throw new Error('No credentials available');
-    }
-
     private async _createTranscribeClient(): Promise<TranscribeStreamingClient> {
-        const credentials = await this._getCredentials();
+        const credentials = await this.awsCredentials.getCredentials();
         return new TranscribeStreamingClient({
             region: this.config.region,
             credentials: {
@@ -293,7 +358,7 @@ export class AWSTranscribeClient {
             return;
         }
 
-        console.log('Silence detected, pausing stream');
+        this._log('Silence detected, pausing stream');
         this.activeStreaming = false;
         this.isActivelySpeaking = false;
         this.config.onSpeechEnd();
@@ -304,7 +369,7 @@ export class AWSTranscribeClient {
             const startTime = Date.now();
 
             this.maxSilenceTimeout = window.setTimeout(() => {
-                console.log('Maximum silence duration reached, stopping stream');
+                this._log('Maximum silence duration reached, stopping stream');
                 this.stop();
             }, this.config.maxSilenceDuration);
 
@@ -336,7 +401,8 @@ export class AWSTranscribeClient {
         if (this.silenceTimeout) {
             clearTimeout(this.silenceTimeout);
         }
-        this.silenceTimeout = window.setTimeout(() => this._handleSilence(), this.config.silenceDuration);
+        // @ts-expect-error: Type mismatch for setTimeout
+        this.silenceTimeout = setTimeout(() => this._handleSilence(), this.config.silenceDuration);
 
         // Reset max silence timeout and countdown
         if (this.maxSilenceTimeout) {
@@ -374,25 +440,28 @@ export class AWSTranscribeClient {
     }
 
     // Handle transcription results processing
-    private async _processTranscriptionResults(stream: any): Promise<void> {
+    private async _processTranscriptionResults(stream: unknown): Promise<void> {
         try {
-            for await (const event of stream.TranscriptResultStream) {
+            // Use appropriate type assertion to handle the stream
+            const typedStream = stream as { TranscriptResultStream: AsyncIterable<TranscriptionResult> };
+
+            for await (const event of typedStream.TranscriptResultStream) {
                 if (event.TranscriptEvent?.Transcript) {
                     const results = event.TranscriptEvent.Transcript.Results;
                     if (results && results.length > 0) {
                         const result = results[0];
-                        console.log('Processing result:', {
+                        this._log('Processing result:', {
                             isPartial: result.IsPartial,
-                            transcript: result.Alternatives[0]?.Transcript || ''
+                            transcript: result.Alternatives?.[0]?.Transcript || ''
                         });
                         if (result.IsPartial) {
                             this._handleTranscription(
                                 this.transcript,
-                                result.Alternatives[0]?.Transcript || '',
+                                result.Alternatives?.[0]?.Transcript || '',
                                 () => { this.transcript = ''; }
                             );
                         } else {
-                            this.transcript += (result.Alternatives[0]?.Transcript || '') + ' ';
+                            this.transcript += (result.Alternatives?.[0]?.Transcript || '') + ' ';
                             this._handleTranscription(
                                 this.transcript,
                                 '',
@@ -402,27 +471,31 @@ export class AWSTranscribeClient {
                     }
                 }
             }
-        } catch (error: any) {
-            console.error('Error processing transcription results:', error);
-            if (error.name !== 'AbortError') {
-                this.config.onError('Transcription error: ' + (error.message || 'Unknown error'));
+        } catch (error: unknown) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            this._log('Error processing transcription results:', error);
+            if (!(error instanceof Error && error.name === 'AbortError')) {
+                this.config.onError('Transcription error: ' + (errorMessage || 'Unknown error'));
             }
         }
     }
 
     public async start(): Promise<boolean> {
         if (this.isListening) {
-            console.log('Already listening');
+            this._log('Already listening');
             return true;
         }
-
         if (!this.browserSupported) {
             this.config.onError("Your browser doesn't support microphone access or Web Audio API.");
             return false;
         }
+        if(!this.AudioContextClass) {
+            this.config.onError("Your browser doesn't support AudioContext.");
+            return false;
+        }
 
         try {
-            console.log('Starting speech recognition...');
+            this._log('Starting speech recognition...');
 
             // Get user media
             this.stream = await navigator.mediaDevices.getUserMedia({
@@ -434,10 +507,7 @@ export class AWSTranscribeClient {
             });
 
             // Create audio context
-            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-            this.audioContext = new AudioContextClass({
-                sampleRate: this.config.sampleRate,
-            });
+            this.audioContext = new this.AudioContextClass({ sampleRate: this.config.sampleRate });
 
             // Create audio source
             this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
@@ -450,7 +520,7 @@ export class AWSTranscribeClient {
             this.processorNode.connect(this.audioContext.destination);
 
             // Create AWS Transcribe client
-            console.log('Creating transcribe client...');
+            this._log('Creating transcribe client...');
             this.transcribeClient = await this._createTranscribeClient();
 
             this.customStream = new ReadableStream();
@@ -461,7 +531,7 @@ export class AWSTranscribeClient {
 
                 const hasVoice = this._detectVoiceActivity(inputData);
                 if (hasVoice && !this.activeStreaming) {
-                    console.log('Voice detected, starting stream');
+                    this._log('Voice detected, starting stream');
                     this.activeStreaming = true;
                     this.isActivelySpeaking = true;
                     this._resetSilenceTimeout();
@@ -480,7 +550,7 @@ export class AWSTranscribeClient {
             };
 
             // Start AWS Transcribe streaming
-            console.log('Creating transcribe command...');
+            this._log('Creating transcribe command...');
             const command = new StartStreamTranscriptionCommand({
                 LanguageCode: this.config.languageCode as LanguageCode,
                 MediaEncoding: MediaEncoding.PCM,
@@ -492,9 +562,9 @@ export class AWSTranscribeClient {
                 SessionId: this.config.generateSessionId()
             });
 
-            console.log('Sending transcribe command...');
+            this._log('Sending transcribe command...');
             this.transcribeStream = await this.transcribeClient.send(command);
-            console.log('Transcribe stream started');
+            this._log('Transcribe stream started');
 
             // Start processing results NOTE: THIS SHOULD NOT BE AWAITED
             this._processTranscriptionResults(this.transcribeStream);
@@ -508,9 +578,10 @@ export class AWSTranscribeClient {
             });
 
             return true;
-        } catch (error: any) {
-            console.error('Error starting transcription:', error);
-            this.config.onError(error.message || "Failed to start transcription");
+        } catch (error: unknown) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            this._log('Error starting transcription:', error);
+            this.config.onError(errorMessage || "Failed to start transcription");
             this.isListening = false;
             this.startTime = null;
             this.stop();
@@ -519,7 +590,7 @@ export class AWSTranscribeClient {
     }
 
     public stop(): boolean {
-        console.log('Stopping streaming...');
+        this._log('Stopping streaming...');
 
         if (this.startTime) {
             const minutesUsedThisSession = (Date.now() - this.startTime) / (1000 * 60);
@@ -531,7 +602,7 @@ export class AWSTranscribeClient {
             try {
                 this.customStream.close();
             } catch (error) {
-                console.error('Error closing custom stream:', error);
+                this._log('Error closing custom stream:', error);
             }
             this.customStream = null;
         }
@@ -541,7 +612,7 @@ export class AWSTranscribeClient {
             try {
                 this.processorNode.disconnect();
             } catch (error) {
-                console.error('Error disconnecting processor node:', error);
+                this._log('Error disconnecting processor node:', error);
             }
             this.processorNode = null;
         }
@@ -550,7 +621,7 @@ export class AWSTranscribeClient {
             try {
                 this.sourceNode.disconnect();
             } catch (error) {
-                console.error('Error disconnecting source node:', error);
+                this._log('Error disconnecting source node:', error);
             }
             this.sourceNode = null;
         }
@@ -559,7 +630,7 @@ export class AWSTranscribeClient {
             try {
                 this.audioContext.close();
             } catch (error) {
-                console.error('Error closing audio context:', error);
+                this._log('Error closing audio context:', error);
             }
             this.audioContext = null;
         }
@@ -569,7 +640,7 @@ export class AWSTranscribeClient {
             try {
                 this.stream.getTracks().forEach(track => track.stop());
             } catch (error) {
-                console.error('Error stopping media tracks:', error);
+                this._log('Error stopping media tracks:', error);
             }
             this.stream = null;
         }
@@ -579,7 +650,7 @@ export class AWSTranscribeClient {
             try {
                 this.transcribeClient.destroy();
             } catch (error) {
-                console.error('Error destroying transcribe client:', error);
+                this._log('Error destroying transcribe client:', error);
             }
             this.transcribeClient = null;
         }
@@ -605,7 +676,7 @@ export class AWSTranscribeClient {
         this.silenceCountdown = null;
         this.activeStreaming = false;
 
-        console.log('Streaming stopped');
+        this._log('Streaming stopped');
 
         this.config.onStateChange({
             isListening: false,

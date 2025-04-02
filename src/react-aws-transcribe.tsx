@@ -1,4 +1,5 @@
-import React, { useEffect, useState, useRef, ReactNode } from 'react';
+import * as React from 'react';
+import { useEffect, useState, useRef, ReactNode } from 'react';
 import { LanguageCode } from "@aws-sdk/client-transcribe-streaming";
 import {
     AWSTranscribeClient,
@@ -126,16 +127,21 @@ export const ReactAWSTranscribe: React.FC<ReactAWSTranscribeProps> = ({
                 clientRef.current.stop();
             }
         };
-    }, []);
+    }, [
+        region, languageCode, sampleRate, vadThreshold, silenceDuration,
+        maxSilenceDuration, credentialsProvider, generateSessionId,
+        onTranscript, onSpeechStart, onSpeechEnd, onError, onStateChange
+    ]);
 
     const toggleListening = async (): Promise<boolean> => {
         if (!clientRef.current) return false;
 
         try {
             return await clientRef.current.toggle();
-        } catch (err: any) {
-            console.error('Error toggling speech recognition:', err);
-            setError(err.message || 'Failed to toggle speech recognition');
+        } catch (err: unknown) {
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            console.error('Error toggling speech recognition:', errorMessage);
+            setError(errorMessage || 'Failed to toggle speech recognition');
             return false;
         }
     };

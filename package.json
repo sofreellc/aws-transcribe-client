@@ -1,6 +1,7 @@
 {
   "name": "aws-transcribe-client",
   "version": "0.1.0",
+  "type": "module",
   "description": "A lightweight TypeScript client for AWS Transcribe streaming with voice activity detection",
   "main": "dist/index.js",
   "module": "dist/index.esm.js",

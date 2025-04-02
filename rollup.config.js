@@ -4,8 +4,12 @@ import commonjs from '@rollup/plugin-commonjs';
 import typescript from '@rollup/plugin-typescript';
 import terser from '@rollup/plugin-terser';
 import dts from 'rollup-plugin-dts';
+import { readFileSync } from 'fs';
 
-import packageJson from './package.json';
+// Load package.json content
+const packageJson = JSON.parse(
+    readFileSync(new URL('./package.json', import.meta.url), 'utf8')
+);
 
 export default [
   // CommonJS and ES Modules builds
