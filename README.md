@@ -1,6 +1,7 @@
 # aws-transcribe-client
 
 A lightweight, browser-compatible TypeScript client for AWS Transcribe streaming with voice activity detection and automatic silence handling.
+Check out the introductory blog post [here](https://kirmanie-ravariere.com/posts/2025_04/aws_transcribe_client_a_lightweight_speech_to_text_solution_with_voice_activity_detection/94a1cb9cc91d0f963e6f609fc8b6c516).
 
 ## Features
 
