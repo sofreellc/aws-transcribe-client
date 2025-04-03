@@ -88,7 +88,7 @@ const TranscriptionApp: React.FC = () => {
 
   const credentialsProvider = async (minutesUsed: number): Promise<TranscribeCredentials> => {
     const response = await fetch('/api/aws-credentials');
-    return await response.json();
+     return { accessKeyId, secretAccessKey, sessionToken, expiration: new Date(expiration) };
   };
 
   const handleTranscript = (data: TranscriptData) => {
